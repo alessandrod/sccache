@@ -15,8 +15,9 @@
 use crate::cache::{Cache, CacheRead, CacheWrite, Storage};
 use hyperx::header::CacheDirective;
 use rusoto_core::{self, Region};
-use rusoto_s3::{GetObjectOutput, GetObjectRequest, PutObjectRequest, S3Client, S3 as _, S3};
+use rusoto_s3::{GetObjectOutput, GetObjectRequest, PutObjectRequest, S3Client, S3 as _};
 use std::io;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
@@ -34,11 +35,25 @@ pub struct S3Cache {
 
 impl S3Cache {
     /// Create a new `S3Cache` storing data in `bucket`.
-    /// TODO: Handle custom region
-    /// TODO: Handle endpoint?
-    /// TODO: Handle use_ssl
-    pub fn new(bucket: &str, _endpoint: &str, _use_ssl: bool, key_prefix: &str) -> Result<S3Cache> {
-        let client = S3Client::new(Region::default());
+    pub fn new(
+        bucket: &str,
+        region: Option<&str>,
+        endpoint: Option<&str>,
+        key_prefix: &str,
+    ) -> Result<S3Cache> {
+        let region = match endpoint {
+            Some(endpoint) => Region::Custom {
+                name: region
+                    .map(ToOwned::to_owned)
+                    .unwrap_or(Region::default().name().to_owned()),
+                endpoint: endpoint.to_owned(),
+            },
+            None => region
+                .map(FromStr::from_str)
+                .unwrap_or_else(|| Ok(Region::default()))?,
+        };
+
+        let client = S3Client::new(region);
         Ok(S3Cache {
             bucket_name: bucket.to_owned(),
             client,
