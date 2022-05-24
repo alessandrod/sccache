@@ -25,7 +25,7 @@ use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
 use crate::lru_disk_cache::{LruCache, Meter};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
-use crate::util::{fmt_duration_as_secs, hash_all, run_input_output, Digest};
+use crate::util::{fmt_duration_as_secs, hash_all, hash_all_archives, run_input_output, Digest};
 use crate::util::{ref_env, HashToDigest, OsStrExt};
 use filetime::FileTime;
 use log::Level::Trace;
@@ -197,8 +197,8 @@ lazy_static! {
 /// Version number for cache key.
 const CACHE_VERSION: &[u8] = b"6";
 
-/// Get absolute paths for all source files listed in rustc's dep-info output.
-async fn get_source_files<T>(
+/// Get absolute paths for all source files and env-deps listed in rustc's dep-info output.
+async fn get_source_files_and_env_deps<T>(
     creator: &T,
     crate_name: &str,
     executable: &Path,
@@ -206,7 +206,7 @@ async fn get_source_files<T>(
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     pool: &tokio::runtime::Handle,
-) -> Result<Vec<PathBuf>>
+) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>)>
 where
     T: CommandCreatorSync,
 {
@@ -238,22 +238,23 @@ where
         })
         .await?;
 
-    parsed.map(move |files| {
+    parsed.map(move |(files, env_deps)| {
         trace!(
-            "[{}]: got {} source files from dep-info in {}",
+            "[{}]: got {} source files and {} env-deps from dep-info in {}",
             crate_name,
             files.len(),
+            env_deps.len(),
             fmt_duration_as_secs(&start.elapsed())
         );
         // Just to make sure we capture temp_dir.
         drop(temp_dir);
-        files
+        (files, env_deps)
     })
 }
 
 /// Parse dependency info from `file` and return a Vec of files mentioned.
 /// Treat paths as relative to `cwd`.
-fn parse_dep_file<T, U>(file: T, cwd: U) -> Result<Vec<PathBuf>>
+fn parse_dep_file<T, U>(file: T, cwd: U) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>)>
 where
     T: AsRef<Path>,
     U: AsRef<Path>,
@@ -261,7 +262,7 @@ where
     let mut f = fs::File::open(file)?;
     let mut deps = String::new();
     f.read_to_string(&mut deps)?;
-    Ok(parse_dep_info(&deps, cwd))
+    Ok((parse_dep_info(&deps, cwd), parse_env_dep_info(&deps)))
 }
 
 fn parse_dep_info<T>(dep_info: &str, cwd: T) -> Vec<PathBuf>
@@ -313,6 +314,20 @@ where
     let mut deps = deps.iter().map(|s| cwd.join(s)).collect::<Vec<_>>();
     deps.sort();
     deps
+}
+
+fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, OsString)> {
+    let mut env_deps = Vec::new();
+    for line in dep_info.lines() {
+        if let Some(env_dep) = line.strip_prefix("# env-dep:") {
+            let mut split = env_dep.splitn(2, '=');
+            match (split.next(), split.next()) {
+                (Some(var), Some(val)) => env_deps.push((var.into(), val.into())),
+                _ => env_deps.push((env_dep.into(), "".into())),
+            }
+        }
+    }
+    env_deps
 }
 
 /// Run `rustc --print file-names` to get the outputs of compilation.
@@ -1300,8 +1315,8 @@ where
             .collect::<Vec<_>>();
         // Find all the source files and hash them
         let source_hashes_pool = pool.clone();
-        let source_files_and_hashes = async {
-            let source_files = get_source_files(
+        let source_files_and_hashes_and_env_deps = async {
+            let (source_files, env_deps) = get_source_files_and_env_deps(
                 creator,
                 &crate_name,
                 &executable,
@@ -1312,7 +1327,7 @@ where
             )
             .await?;
             let source_hashes = hash_all(&source_files, &source_hashes_pool).await?;
-            Ok((source_files, source_hashes))
+            Ok((source_files, source_hashes, env_deps))
         };
 
         // Hash the contents of the externs listed on the commandline.
@@ -1322,10 +1337,13 @@ where
         // Hash the contents of the staticlibs listed on the commandline.
         trace!("[{}]: hashing {} staticlibs", crate_name, staticlibs.len());
         let abs_staticlibs = staticlibs.iter().map(|s| cwd.join(s)).collect::<Vec<_>>();
-        let staticlib_hashes = hash_all(&abs_staticlibs, pool);
+        let staticlib_hashes = hash_all_archives(&abs_staticlibs, pool);
 
-        let ((source_files, source_hashes), extern_hashes, staticlib_hashes) =
-            futures::try_join!(source_files_and_hashes, extern_hashes, staticlib_hashes)?;
+        let ((source_files, source_hashes, mut env_deps), extern_hashes, staticlib_hashes) = futures::try_join!(
+            source_files_and_hashes_and_env_deps,
+            extern_hashes,
+            staticlib_hashes
+        )?;
         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
         let mut m = Digest::new();
         // Hash inputs:
@@ -1375,12 +1393,15 @@ where
         {
             m.update(h.as_bytes());
         }
-        // 7. Environment variables. Ideally we'd use anything referenced
-        // via env! in the program, but we don't have a way to determine that
-        // currently, and hashing all environment variables is too much, so
-        // we'll just hash the CARGO_ env vars and hope that's sufficient.
-        // Upstream Rust issue tracking getting information about env! usage:
-        // https://github.com/rust-lang/rust/issues/40364
+        // 7. Environment variables: Hash all environment variables listed in the rustc dep-info
+        //    output. Additionally also has all environment variables starting with `CARGO_`,
+        //    since those are not listed in dep-info but affect cacheability.
+        env_deps.sort();
+        for &(ref var, ref val) in env_deps.iter() {
+            var.hash(&mut HashToDigest { digest: &mut m });
+            m.update(b"=");
+            val.hash(&mut HashToDigest { digest: &mut m });
+        }
         let mut env_vars: Vec<_> = env_vars
             .iter()
             // Filter out RUSTC_COLOR since we control color usage with command line flags.
@@ -1732,6 +1753,41 @@ struct RustInputsPackager {
 }
 
 #[cfg(feature = "dist-client")]
+fn can_trim_this(input_path: &Path) -> bool {
+    trace!("can_trim_this: input_path={:?}", input_path);
+    let mut ar_path = input_path.to_path_buf();
+    ar_path.set_extension("a");
+    // Check if the input path exists with both a .rlib and a .a, in which case
+    // we want to refuse to trim, otherwise triggering
+    // https://bugzilla.mozilla.org/show_bug.cgi?id=1760743
+    input_path
+        .extension()
+        .map(|e| e == RLIB_EXTENSION)
+        .unwrap_or(false)
+        && !ar_path.exists()
+}
+
+#[test]
+#[cfg(feature = "dist-client")]
+fn test_can_trim_this() {
+    use crate::test::utils::create_file;
+    let tempdir = tempfile::Builder::new()
+        .prefix("sccache_test")
+        .tempdir()
+        .unwrap();
+    let tempdir = tempdir.path();
+
+    // With only one rlib file we should be fine
+    let rlib_file = create_file(tempdir, "libtest.rlib", |_f| Ok(())).unwrap();
+    assert!(can_trim_this(&rlib_file));
+
+    // Adding an ar from a staticlib (i.e., crate-type = ["staticlib", "rlib"]
+    // we need to refuse to allow trimming
+    let _ar_file = create_file(tempdir, "libtest.a", |_f| Ok(())).unwrap();
+    assert!(!can_trim_this(&rlib_file));
+}
+
+#[cfg(feature = "dist-client")]
 impl pkg::InputsPackager for RustInputsPackager {
     #[allow(clippy::cognitive_complexity)] // TODO simplify this method.
     fn write_inputs(self: Box<Self>, wtr: &mut dyn io::Write) -> Result<dist::PathTransformer> {
@@ -1882,12 +1938,7 @@ impl pkg::InputsPackager for RustInputsPackager {
         for (input_path, dist_input_path) in all_tar_inputs.iter() {
             let mut file_header = pkg::make_tar_header(input_path, dist_input_path)?;
             let file = fs::File::open(input_path)?;
-            if can_trim_rlibs
-                && input_path
-                    .extension()
-                    .map(|e| e == RLIB_EXTENSION)
-                    .unwrap_or(false)
-            {
+            if can_trim_rlibs && can_trim_this(input_path) {
                 let mut archive = ar::Archive::new(file);
 
                 while let Some(entry_result) = archive.next_entry() {
@@ -2255,10 +2306,12 @@ impl RlibDepReader {
 #[cfg(feature = "dist-client")]
 fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
     let mut lines = stdout.lines();
-    match lines.next() {
-        Some("=External Dependencies=") => {}
-        Some(s) => bail!("Unknown first line from rustc -Z ls: {}", s),
-        None => bail!("No output from rustc -Z ls"),
+    loop {
+        match lines.next() {
+            Some("=External Dependencies=") => break,
+            Some(_s) => {}
+            None => bail!("No output from rustc -Z ls"),
+        }
     }
 
     let mut dep_names = vec![];
@@ -2322,7 +2375,7 @@ mod test {
     use itertools::Itertools;
     use std::ffi::OsStr;
     use std::fs::File;
-    use std::io::Write;
+    use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
 
     fn _parse_arguments(arguments: &[String]) -> CompilerArguments<ParsedArguments> {
@@ -2874,8 +2927,33 @@ c:/foo/bar.rs:
 
     #[cfg(feature = "dist-client")]
     #[test]
-    fn test_parse_rustc_z_ls() {
+    fn test_parse_rustc_z_ls_pre_1_55() {
         let output = "=External Dependencies=
+1 lucet_runtime
+2 lucet_runtime_internals-1ff6232b6940e924
+3 lucet_runtime_macros-c18e1952b835769e
+
+
+";
+        let res = parse_rustc_z_ls(output);
+        assert!(res.is_ok());
+        let res = res.unwrap();
+        assert_eq!(res.len(), 3);
+        assert_eq!(res[0], "lucet_runtime");
+        assert_eq!(res[1], "lucet_runtime_internals");
+        assert_eq!(res[2], "lucet_runtime_macros");
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_parse_rustc_z_ls_post_1_55() {
+        // This was introduced in rust 1.55 by
+        // https://github.com/rust-lang/rust/commit/cef3ab75b12155e0582dd8b7710b7b901215fdd6
+        let output = "Crate info:
+name lucet_runtime
+hash 6c42566fc9757bba stable_crate_id StableCrateId(11157525371370257329)
+proc_macro false
+=External Dependencies=
 1 lucet_runtime
 2 lucet_runtime_internals-1ff6232b6940e924
 3 lucet_runtime_macros-c18e1952b835769e
@@ -2932,13 +3010,28 @@ c:/foo/bar.rs:
 
     #[test]
     fn test_generate_hash_key() {
+        use ar::{Builder, Header};
         drop(env_logger::try_init());
         let f = TestFixture::new();
         const FAKE_DIGEST: &str = "abcd1234";
+        const BAZ_O_SIZE: u64 = 1024;
         // We'll just use empty files for each of these.
-        for s in ["foo.rs", "bar.rs", "bar.rlib", "libbaz.a"].iter() {
+        for s in ["foo.rs", "bar.rs", "bar.rlib"].iter() {
             f.touch(s).unwrap();
         }
+        // libbaz.a needs to be a valid archive.
+        create_file(f.tempdir.path(), "libbaz.a", |f| {
+            let mut builder = Builder::new(f);
+            let hdr = Header::new(b"baz.o".to_vec(), BAZ_O_SIZE);
+            builder.append(&hdr, io::repeat(0).take(BAZ_O_SIZE))?;
+            Ok(())
+        })
+        .unwrap();
+        let mut m = Digest::new();
+        m.update(b"baz.o");
+        m.update(&vec![0; BAZ_O_SIZE as usize]);
+        let libbaz_a_digest = m.finish();
+
         let mut emit = HashSet::new();
         emit.insert("link".to_string());
         emit.insert("metadata".to_string());
@@ -3017,8 +3110,9 @@ c:/foo/bar.rs:
         m.update(empty_digest.as_bytes());
         // bar.rlib (extern crate, from externs)
         m.update(empty_digest.as_bytes());
-        // libbaz.a (static library, from staticlibs)
-        m.update(empty_digest.as_bytes());
+        // libbaz.a (static library, from staticlibs), containing a single
+        // file, baz.o, consisting of 1024 bytes of zeroes.
+        m.update(libbaz_a_digest.as_bytes());
         // Env vars
         OsStr::new("CARGO_BLAH").hash(&mut HashToDigest { digest: &mut m });
         m.update(b"=");

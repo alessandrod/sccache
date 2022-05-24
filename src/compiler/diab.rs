@@ -32,7 +32,9 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 #[derive(Clone, Debug)]
-pub struct Diab;
+pub struct Diab {
+    pub version: Option<String>,
+}
 
 #[async_trait]
 impl CCompilerImpl for Diab {
@@ -41,6 +43,9 @@ impl CCompilerImpl for Diab {
     }
     fn plusplus(&self) -> bool {
         false
+    }
+    fn version(&self) -> Option<String> {
+        self.version.clone()
     }
     fn parse_arguments(
         &self,
@@ -283,6 +288,7 @@ where
         profile_generate: false,
         // FIXME: Implement me.
         color_mode: ColorMode::Auto,
+        suppress_rewrite_includes_only: false,
     })
 }
 
@@ -681,6 +687,7 @@ mod test {
             msvc_show_includes: false,
             profile_generate: false,
             color_mode: ColorMode::Auto,
+            suppress_rewrite_includes_only: false,
         };
         let compiler = &f.bins[0];
         // Compiler invocation.

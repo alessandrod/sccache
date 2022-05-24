@@ -39,6 +39,7 @@ pub struct Msvc {
     /// The prefix used in the output of `-showIncludes`.
     pub includes_prefix: String,
     pub is_clang: bool,
+    pub version: Option<String>,
 }
 
 #[async_trait]
@@ -48,6 +49,9 @@ impl CCompilerImpl for Msvc {
     }
     fn plusplus(&self) -> bool {
         false
+    }
+    fn version(&self) -> Option<String> {
+        self.version.clone()
     }
     fn parse_arguments(
         &self,
@@ -388,10 +392,16 @@ msvc_args!(static ARGS: [ArgInfo<ArgData>; _] = [
     msvc_take_arg!("doc", PathBuf, Concatenated, TooHardPath), // Creates an .xdc file.
     msvc_take_arg!("errorReport:", OsString, Concatenated, PassThroughWithSuffix), // Deprecated.
     msvc_take_arg!("execution-charset:", OsString, Concatenated, PassThroughWithSuffix),
+    msvc_flag!("experimental:external", PassThrough),
     msvc_flag!("experimental:module", TooHardFlag),
     msvc_flag!("experimental:module-", PassThrough), // Explicitly disabled modules.
     msvc_take_arg!("experimental:preprocessor", OsString, Concatenated, PassThroughWithSuffix),
     msvc_take_arg!("external:I", PathBuf, CanBeSeparated, ExternalIncludePath),
+    msvc_flag!("external:W0", PassThrough),
+    msvc_flag!("external:W1", PassThrough),
+    msvc_flag!("external:W2", PassThrough),
+    msvc_flag!("external:W3", PassThrough),
+    msvc_flag!("external:W4", PassThrough),
     msvc_take_arg!("favor:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_take_arg!("fp:", OsString, Concatenated, PassThroughWithSuffix),
     msvc_take_arg!("fsanitize-blacklist", PathBuf, Concatenated('='), ExtraHashFile),
@@ -597,7 +607,9 @@ pub fn parse_arguments(
                 | Some(NoDiagnosticsColorFlag)
                 | Some(Arch(_))
                 | Some(PassThrough(_))
-                | Some(PassThroughPath(_)) => &mut common_args,
+                | Some(PassThroughPath(_))
+                | Some(PedanticFlag)
+                | Some(Standard(_)) => &mut common_args,
 
                 Some(ProfileGenerate) => {
                     profile_generate = true;
@@ -687,6 +699,7 @@ pub fn parse_arguments(
         profile_generate,
         // FIXME: implement color_mode for msvc.
         color_mode: ColorMode::Auto,
+        suppress_rewrite_includes_only: false,
     })
 }
 
@@ -1238,6 +1251,43 @@ mod test {
     }
 
     #[test]
+    fn test_parse_arguments_external_warning_suppression_forward_slashes() {
+        // Parsing /external:W relies on /experimental:external being parsed
+        // and placed into common_args.
+        for n in 0..5 {
+            let args = ovec![
+                "-c",
+                "foo.c",
+                "/Fofoo.obj",
+                "/experimental:external",
+                format!("/external:W{}", n)
+            ];
+            let ParsedArguments {
+                input,
+                language,
+                outputs,
+                preprocessor_args,
+                msvc_show_includes,
+                common_args,
+                ..
+            } = match parse_arguments(args) {
+                CompilerArguments::Ok(args) => args,
+                o => panic!("Got unexpected parse result: {:?}", o),
+            };
+            assert_eq!(Some("foo.c"), input.to_str());
+            assert_eq!(Language::C, language);
+            assert_map_contains!(outputs, ("obj", PathBuf::from("foo.obj")));
+            assert_eq!(1, outputs.len());
+            assert!(preprocessor_args.is_empty());
+            assert_eq!(
+                common_args,
+                ovec!["/experimental:external", format!("/external:W{}", n)]
+            );
+            assert!(!msvc_show_includes);
+        }
+    }
+
+    #[test]
     fn test_parse_arguments_empty_args() {
         assert_eq!(CompilerArguments::NotCompilation, parse_arguments(vec!()));
     }
@@ -1348,6 +1398,7 @@ mod test {
             msvc_show_includes: false,
             profile_generate: false,
             color_mode: ColorMode::Auto,
+            suppress_rewrite_includes_only: false,
         };
         let compiler = &f.bins[0];
         // Compiler invocation.
@@ -1391,6 +1442,7 @@ mod test {
             msvc_show_includes: false,
             profile_generate: false,
             color_mode: ColorMode::Auto,
+            suppress_rewrite_includes_only: false,
         };
         let compiler = &f.bins[0];
         // Compiler invocation.
